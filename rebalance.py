@@ -10,7 +10,10 @@ If proposed buys would exceed available cash plus proposed sell proceeds,
 every buy is scaled down proportionally so the resulting trade plan is
 always fundable -- rather than either overspending or refusing to act.
 Funding is computed from the same rounded, executable sell quantities
-that are actually returned, not from raw pre-rounding sell values.
+that are actually returned, not from raw pre-rounding sell values, and
+all quantities are rounded toward zero (never up) so that neither a
+capped sell nor a scaled buy can end up larger than what it was capped
+or scaled to.
 
 This is deliberately simple on purpose: no Sharpe ratio, no mean-variance
 optimization. Get this loop (real data -> compute -> proposed trade ->
@@ -21,6 +24,24 @@ a prerequisite.
 from __future__ import annotations
 
 import math
+
+_QTY_DECIMALS = 4
+_QTY_SCALE = 10 ** _QTY_DECIMALS
+_FLOOR_EPS = 1e-9  # guards against float imprecision underflooring a value
+                     # that is mathematically exact at the 4-decimal boundary
+
+
+def _floor_qty(x: float) -> float:
+    """Round a non-negative quantity DOWN to 4 decimals, never up.
+
+    Used for anything derived from a cap or a funding constraint (sell
+    quantities capped at holdings, buy quantities scaled to available
+    funds) so that rounding can only shrink the trade, never grow it
+    past the limit it was just constrained to.
+    """
+    if x <= 0:
+        return 0.0
+    return math.floor(x * _QTY_SCALE + _FLOOR_EPS) / _QTY_SCALE
 
 
 def compute_rebalance(
@@ -37,7 +58,7 @@ def compute_rebalance(
     target_weights: {"AAPL": 0.3, "MSFT": 0.3, "SPY": 0.4} -- must sum to <= 1.0,
                      no negative or non-finite weights
     cash: uninvested cash, counts toward total portfolio value. Must be
-          non-negative -- this model has no concept of margin/negative cash.
+          non-negative -- this model has no concept of margin or debt.
     drift_threshold: only propose a trade if current weight is off by more
                       than this (e.g. 0.05 = 5 percentage points). A position
                       exactly at the threshold is NOT traded.
@@ -128,16 +149,18 @@ def compute_rebalance(
             "drift": drift,
         })
 
-    # Finalize sells FIRST, at the same rounded/capped quantities that will
-    # actually be returned -- funding must be computed from executable
-    # proceeds, not from a raw value that later rounds or caps to nothing.
+    # Finalize sells FIRST, at the same executable quantities that will
+    # actually be returned. Cap at held qty, then floor (never round up)
+    # to 4 decimals -- a capped-then-rounded-up sell could exceed the
+    # position, and funding must be computed from a quantity that's
+    # actually fillable, not one that overstates it.
     sells = [t for t in raw_trades if "trade_qty" in t and t["trade_qty"] < 0]
     buys = [t for t in raw_trades if "trade_qty" in t and t["trade_qty"] > 0]
 
     for t in sells:
         held = held_qty.get(t["symbol"], 0.0)
         capped = min(abs(t["trade_qty"]), held)
-        t["qty_final"] = round(capped, 4)
+        t["qty_final"] = _floor_qty(capped)
         t["est_value"] = round(t["qty_final"] * t["price"], 2) if t["qty_final"] > 0 else 0.0
 
     sell_total = sum(t["est_value"] for t in sells if t["qty_final"] > 0)
@@ -162,8 +185,17 @@ def compute_rebalance(
         for t in buys:
             t["trade_qty"] *= scale
 
-    # Second pass: assemble output. Sells use the quantities already
-    # finalized above (pre-scaling); buys are rounded now, post-scaling.
+    # Finalize buys: floor (never round up) to 4 decimals. Scaling
+    # constrains the *unrounded* total to available_funds exactly; rounding
+    # each buy independently to nearest can push the aggregate back over
+    # budget. Flooring every buy can only shrink it, so the rounded
+    # aggregate is guaranteed <= the unrounded scaled aggregate <=
+    # available_funds.
+    for t in buys:
+        t["qty_final"] = _floor_qty(t["trade_qty"])
+        t["est_value"] = round(t["qty_final"] * t["price"], 2) if t["qty_final"] > 0 else 0.0
+
+    # Second pass: assemble output from the finalized quantities.
     trades = []
     for t in raw_trades:
         if t.get("skipped_no_price"):
@@ -177,31 +209,14 @@ def compute_rebalance(
             })
             continue
 
-        if t["trade_qty"] < 0 or "qty_final" in t:
-            # Sell: already finalized above.
-            if t["qty_final"] <= 0:
-                continue
-            trades.append({
-                "symbol": t["symbol"],
-                "action": "sell",
-                "qty": t["qty_final"],
-                "est_value": t["est_value"],
-                "current_weight": round(t["current_weight"], 4),
-                "target_weight": round(t["target_weight"], 4),
-                "drift": round(t["drift"], 4),
-            })
+        if t["qty_final"] <= 0:
             continue
 
-        # Buy: round now, after any scaling applied above.
-        qty_final = round(t["trade_qty"], 4)
-        if qty_final <= 0:
-            continue
-        est_value = round(qty_final * t["price"], 2)
         trades.append({
             "symbol": t["symbol"],
-            "action": "buy",
-            "qty": qty_final,
-            "est_value": est_value,
+            "action": "buy" if t["trade_qty"] > 0 else "sell",
+            "qty": t["qty_final"],
+            "est_value": t["est_value"],
             "current_weight": round(t["current_weight"], 4),
             "target_weight": round(t["target_weight"], 4),
             "drift": round(t["drift"], 4),
