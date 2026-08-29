@@ -45,7 +45,7 @@ def compute_rebalance(
         raise ValueError("drift_threshold must be a finite, non-negative number")
     if not math.isfinite(cash):
         raise ValueError("cash must be a finite number")
-    if any(not math.isfinite(pr) for pr in prices.values()):
+    if any(pr is not None and not math.isfinite(pr) for pr in prices.values()):
         raise ValueError("prices must be finite numbers")
 
     # Parse holdings once, validating qty as we go.
@@ -118,6 +118,9 @@ def compute_rebalance(
         if trade_qty < 0:
             # Selling -- never round up past what's actually held.
             qty_final = min(qty_final, held_qty.get(symbol, 0.0))
+        if qty_final <= 0:
+            # Rounded down to nothing -- not a real order, skip it.
+            continue
         est_value = round(qty_final * price, 2)
 
         trades.append({
