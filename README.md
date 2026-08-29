@@ -43,15 +43,31 @@ TrueForge (Docker, localhost:8791)
 - A Mistral API key
 - A Daytona account + API key
 
-### 1. Start TrueForge
+### 1. Clone this repo
 ```bash
-git clone <this repo>
+git clone https://github.com/AdityaD1710/portfolio-rebalance-agent
 cd portfolio-rebalance-agent
-docker compose up -d
+```
+This repo holds `rebalance.py` (the sandbox calculation, used in step 5)
+and this README. TrueForge itself is a separate open-source project — set
+up next.
+
+### 2. Start TrueForge
+TrueForge is [TrueFoundry's open-source agent harness](https://github.com/truefoundry/trueforge),
+run independently of this repo. Hosted mode (Docker Compose), matching the
+architecture above:
+```bash
+git clone https://github.com/truefoundry/trueforge && cd trueforge
+cp packages/trueforge/.env.example packages/trueforge/.env
+docker compose up --build
 ```
 Open `http://localhost:8791`.
 
-### 2. Bridge Alpaca's MCP server
+> For a quicker single-user try instead of Docker, `npx @truefoundry/trueforge@latest`
+> runs TrueForge as one process with local SQLite storage — see the
+> [quickstart](https://trueforge.dev/quickstart) for both modes.
+
+### 3. Bridge Alpaca's MCP server
 Alpaca's official MCP server is stdio-only; TrueForge's custom connectors
 need a URL, so it's bridged with `mcp-proxy`:
 ```bash
@@ -64,14 +80,14 @@ mcp-proxy --port=8000 \
 ```
 Leave this running for as long as TrueForge needs to reach Alpaca.
 
-### 3. Configure TrueForge
+### 4. Configure TrueForge
 - **Settings → Models**: add Mistral as a custom OpenAI-compatible
   provider (`https://api.mistral.ai/v1`), model `mistral-small-latest`.
 - **Settings → Sandbox providers**: connect Daytona with your API key.
 - **Settings → Connectors → Add MCP Server**: point at
   `http://host.docker.internal:8000/sse`, Auth type: None.
 
-### 4. Run it
+### 5. Run it
 Start a chat, enable the Alpaca connector, and ask it to rebalance your
 portfolio toward a target allocation (e.g. "30% AAPL, 30% MSFT, 40% SPY").
 See `rebalance.py` for the exact calculation logic used in the sandbox.
@@ -89,7 +105,6 @@ No secrets are committed to this repository.
 
 ## Qodo Code Review Evidence
 
-<!-- TODO: link the PR once Qodo's review is visible on it -->
 PR #1: `Add target-allocation rebalance calculation` —
 [link](https://github.com/AdityaD1710/portfolio-rebalance-agent/pull/1)
 
