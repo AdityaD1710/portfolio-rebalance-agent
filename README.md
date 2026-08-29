@@ -1,5 +1,5 @@
 # Portfolio Rebalance Agent
-
+Setup for portfolio rebalance agent
 Built for **The Agent Harness Hackathon** (WeMakeDevs x TrueFoundry) — "Best Use of TrueForge" track.
 
 An agent that fetches your real Alpaca paper-trading portfolio, computes a
