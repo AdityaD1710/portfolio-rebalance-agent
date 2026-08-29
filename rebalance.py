@@ -32,23 +32,12 @@ _FLOOR_EPS = 1e-9  # guards against float imprecision underflooring a value
 
 
 def _floor_qty(x: float) -> float:
-    """Round a non-negative quantity DOWN to 4 decimals, never up.
-
-    Used for anything derived from a cap or a funding constraint (sell
-    quantities capped at holdings, buy quantities scaled to available
-    funds) so that rounding can only shrink the trade, never grow it
-    past the limit it was just constrained to.
-    """
+    """Round a non-negative quantity DOWN to 4 decimals, never up."""
     if x <= 0:
         return 0.0
     try:
         return math.floor(x * _QTY_SCALE + _FLOOR_EPS) / _QTY_SCALE
     except OverflowError:
-        # x is large enough that x * _QTY_SCALE overflows to infinity
-        # (only possible near float's ~1.8e308 ceiling). A float at that
-        # magnitude has no fractional precision left to floor away in
-        # the first place, so return it unchanged -- still satisfies
-        # "never increases the quantity".
         return x
 
 
@@ -59,18 +48,6 @@ def compute_rebalance(
     cash: float = 0.0,
     drift_threshold: float = 0.05,
 ) -> dict:
-    """
-    positions: [{"symbol": "AAPL", "qty": 10}, ...] -- qty may be a string
-               (Alpaca's Position schema returns qty as a string) or a number.
-    prices: {"AAPL": 227.50, ...}  -- current price per share
-    target_weights: {"AAPL": 0.3, "MSFT": 0.3, "SPY": 0.4} -- must sum to <= 1.0,
-                     no negative or non-finite weights
-    cash: uninvested cash, counts toward total portfolio value. Must be
-          non-negative -- this model has no concept of margin or debt.
-    drift_threshold: only propose a trade if current weight is off by more
-                      than this (e.g. 0.05 = 5 percentage points). A position
-                      exactly at the threshold is NOT traded.
-    """
     if any(not math.isfinite(w) for w in target_weights.values()):
         raise ValueError("target_weights must be finite numbers")
     if any(w < 0 for w in target_weights.values()):
@@ -81,22 +58,38 @@ def compute_rebalance(
         raise ValueError("drift_threshold must be a finite, non-negative number")
     if not math.isfinite(cash) or cash < 0:
         raise ValueError("cash must be a non-negative finite number")
-    if any(pr is not None and not math.isfinite(pr) for pr in prices.values()):
-        raise ValueError("prices must be finite numbers")
 
-    # Parse holdings once, validating qty as we go.
+    normalized_prices: dict[str, float | None] = {}
+    for symbol, pr in prices.items():
+        if pr is None:
+            normalized_prices[symbol] = None
+            continue
+        try:
+            pr_f = float(pr)
+        except (TypeError, ValueError):
+            raise ValueError(f"price for {symbol} is not a number: {pr!r}")
+        if not math.isfinite(pr_f):
+            raise ValueError(f"non-finite price for {symbol}")
+        normalized_prices[symbol] = pr_f
+    prices = normalized_prices
+
     held_qty: dict[str, float] = {}
-    for p in positions:
+    for i, p in enumerate(positions):
+        if "symbol" not in p:
+            raise ValueError(f"positions[{i}] is missing required key 'symbol'")
         symbol = p["symbol"]
-        qty = float(p["qty"])
+        if "qty" not in p:
+            raise ValueError(f"positions[{i}] ({symbol}) is missing required key 'qty'")
+        try:
+            qty = float(p["qty"])
+        except (TypeError, ValueError):
+            raise ValueError(f"qty for {symbol} is not a number: {p['qty']!r}")
         if not math.isfinite(qty):
             raise ValueError(f"non-finite qty for {symbol}")
+        if qty < 0:
+            raise ValueError(f"negative qty for {symbol}: {qty} (short positions are not supported)")
         held_qty[symbol] = held_qty.get(symbol, 0.0) + qty
 
-    # A held position with no usable price can't be safely priced into the
-    # total -- and excluding it would understate the portfolio and mis-size
-    # trades for every *other* symbol too. Refuse to guess for anyone rather
-    # than partially rebalance against a corrupted total.
     missing_price_symbols = sorted(
         symbol for symbol in held_qty
         if prices.get(symbol) is None or prices.get(symbol, 0) <= 0
@@ -121,7 +114,6 @@ def compute_rebalance(
 
     all_symbols = sorted(set(target_weights) | set(current_values))
 
-    # First pass: raw (unrounded, signed) trade candidates.
     raw_trades = []
     for symbol in all_symbols:
         price = prices.get(symbol)
@@ -145,8 +137,8 @@ def compute_rebalance(
             continue
 
         target_value = target_weight * total_value
-        trade_value = target_value - current_value  # signed: + buy, - sell
-        trade_qty = trade_value / price  # signed
+        trade_value = target_value - current_value
+        trade_qty = trade_value / price
 
         raw_trades.append({
             "symbol": symbol,
@@ -157,11 +149,6 @@ def compute_rebalance(
             "drift": drift,
         })
 
-    # Finalize sells FIRST, at the same executable quantities that will
-    # actually be returned. Cap at held qty, then floor (never round up)
-    # to 4 decimals -- a capped-then-rounded-up sell could exceed the
-    # position, and funding must be computed from a quantity that's
-    # actually fillable, not one that overstates it.
     sells = [t for t in raw_trades if "trade_qty" in t and t["trade_qty"] < 0]
     buys = [t for t in raw_trades if "trade_qty" in t and t["trade_qty"] > 0]
 
@@ -171,22 +158,11 @@ def compute_rebalance(
         t["qty_final"] = _floor_qty(capped)
         t["est_value"] = round(t["qty_final"] * t["price"], 2) if t["qty_final"] > 0 else 0.0
 
-    # Funding must use the exact (unrounded-to-cent) proceeds each sell
-    # realizes -- est_value is cent-rounded for display and can round UP
-    # by up to half a cent per sell, which would let buys draw on proceeds
-    # that don't actually exist.
     sell_total = sum(t["qty_final"] * t["price"] for t in sells if t["qty_final"] > 0)
-    available_funds = cash + sell_total  # cash >= 0 and sell_total >= 0, so this is always >= 0
+    available_funds = cash + sell_total
 
     buy_total = sum(t["trade_qty"] * t["price"] for t in buys)
 
-    # A per-symbol drift filter can retain a buy while suppressing smaller
-    # offsetting sells, so proposed buys can exceed cash + executable sell
-    # proceeds. Scale every buy down proportionally to fit, rather than
-    # either overspending or refusing to act. available_funds is guaranteed
-    # non-negative (cash is validated non-negative, sell_total is a sum of
-    # non-negative values), so scale can never go negative and flip a buy
-    # into a sell.
     scale_note = None
     if buy_total > available_funds and buy_total > 0:
         scale = available_funds / buy_total
@@ -197,17 +173,10 @@ def compute_rebalance(
         for t in buys:
             t["trade_qty"] *= scale
 
-    # Finalize buys: floor (never round up) to 4 decimals. Scaling
-    # constrains the *unrounded* total to available_funds exactly; rounding
-    # each buy independently to nearest can push the aggregate back over
-    # budget. Flooring every buy can only shrink it, so the rounded
-    # aggregate is guaranteed <= the unrounded scaled aggregate <=
-    # available_funds.
     for t in buys:
         t["qty_final"] = _floor_qty(t["trade_qty"])
         t["est_value"] = round(t["qty_final"] * t["price"], 2) if t["qty_final"] > 0 else 0.0
 
-    # Second pass: assemble output from the finalized quantities.
     trades = []
     for t in raw_trades:
         if t.get("skipped_no_price"):
@@ -238,25 +207,3 @@ def compute_rebalance(
     if scale_note:
         result["note"] = scale_note
     return result
-
-
-if __name__ == "__main__":
-    import json
-
-    sample_positions = [
-        {"symbol": "AAPL", "qty": "100"},
-        {"symbol": "MSFT", "qty": "50"},
-        {"symbol": "SPY", "qty": "20"},
-    ]
-    sample_prices = {"AAPL": 227.50, "MSFT": 415.20, "SPY": 560.10}
-    sample_targets = {"AAPL": 0.30, "MSFT": 0.30, "SPY": 0.40}
-    sample_cash = 5000.0
-
-    result = compute_rebalance(
-        positions=sample_positions,
-        prices=sample_prices,
-        target_weights=sample_targets,
-        cash=sample_cash,
-        drift_threshold=0.05,
-    )
-    print(json.dumps(result, indent=2))
