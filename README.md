@@ -1,5 +1,5 @@
 # Portfolio Rebalance Agent
-Setup for portfolio rebalance agent
+
 Built for **The Agent Harness Hackathon** (WeMakeDevs x TrueFoundry) — "Best Use of TrueForge" track.
 
 An agent that fetches your real Alpaca paper-trading portfolio, computes a
@@ -43,31 +43,18 @@ TrueForge (Docker, localhost:8791)
 - A Mistral API key
 - A Daytona account + API key
 
-### 1. Clone this repo
+### 1. Start TrueForge
+TrueForge itself is a separate, standalone project (not bundled in this
+repo) — clone and run it per its own instructions:
 ```bash
-git clone https://github.com/AdityaD1710/portfolio-rebalance-agent
-cd portfolio-rebalance-agent
+git clone https://github.com/truefoundry/trueforge.git
+cd trueforge
+docker compose up -d
 ```
-This repo holds `rebalance.py` (the sandbox calculation, used in step 5)
-and this README. TrueForge itself is a separate open-source project — set
-up next.
+Open `http://localhost:8791`. Then clone this repo separately for
+`rebalance.py` and the setup steps below.
 
-### 2. Start TrueForge
-TrueForge is [TrueFoundry's open-source agent harness](https://github.com/truefoundry/trueforge),
-run independently of this repo. Hosted mode (Docker Compose), matching the
-architecture above:
-```bash
-git clone https://github.com/truefoundry/trueforge && cd trueforge
-cp packages/trueforge/.env.example packages/trueforge/.env
-docker compose up --build
-```
-Open `http://localhost:8791`.
-
-> For a quicker single-user try instead of Docker, `npx @truefoundry/trueforge@latest`
-> runs TrueForge as one process with local SQLite storage — see the
-> [quickstart](https://trueforge.dev/quickstart) for both modes.
-
-### 3. Bridge Alpaca's MCP server
+### 2. Bridge Alpaca's MCP server
 Alpaca's official MCP server is stdio-only; TrueForge's custom connectors
 need a URL, so it's bridged with `mcp-proxy`:
 ```bash
@@ -80,14 +67,14 @@ mcp-proxy --port=8000 \
 ```
 Leave this running for as long as TrueForge needs to reach Alpaca.
 
-### 4. Configure TrueForge
+### 3. Configure TrueForge
 - **Settings → Models**: add Mistral as a custom OpenAI-compatible
   provider (`https://api.mistral.ai/v1`), model `mistral-small-latest`.
 - **Settings → Sandbox providers**: connect Daytona with your API key.
 - **Settings → Connectors → Add MCP Server**: point at
   `http://host.docker.internal:8000/sse`, Auth type: None.
 
-### 5. Run it
+### 4. Run it
 Start a chat, enable the Alpaca connector, and ask it to rebalance your
 portfolio toward a target allocation (e.g. "30% AAPL, 30% MSFT, 40% SPY").
 See `rebalance.py` for the exact calculation logic used in the sandbox.
@@ -106,7 +93,14 @@ No secrets are committed to this repository.
 ## Qodo Code Review Evidence
 
 PR #1: `Add target-allocation rebalance calculation` —
-[link](https://github.com/AdityaD1710/portfolio-rebalance-agent/pull/1)
+[github.com/AdityaD1710/portfolio-rebalance-agent/pull/1](https://github.com/AdityaD1710/portfolio-rebalance-agent/pull/1)
+
+Qodo flagged 8 findings (invalid syntax from a trigger commit, unsafe
+string-quantity handling, missing input validation, an off-by-boundary
+threshold check, an undocumented Compose dependency, and an unfunded-trade
+edge case). All were addressed in follow-up commits on the same PR,
+including a full rewrite of `compute_rebalance` with strict input
+validation and funding-safe buy scaling.
 
 ## Demo
 
