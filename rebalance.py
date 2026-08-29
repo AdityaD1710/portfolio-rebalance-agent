@@ -14,6 +14,8 @@ a prerequisite.
 
 from __future__ import annotations
 
+import math
+
 
 def compute_rebalance(
     positions: list[dict],
@@ -27,36 +29,61 @@ def compute_rebalance(
                (Alpaca's Position schema returns qty as a string) or a number.
     prices: {"AAPL": 227.50, ...}  -- current price per share
     target_weights: {"AAPL": 0.3, "MSFT": 0.3, "SPY": 0.4} -- must sum to <= 1.0,
-                     no negative weights
+                     no negative or non-finite weights
     cash: uninvested cash, counts toward total portfolio value
     drift_threshold: only propose a trade if current weight is off by more
                       than this (e.g. 0.05 = 5 percentage points). A position
                       exactly at the threshold is NOT traded.
     """
+    if any(not math.isfinite(w) for w in target_weights.values()):
+        raise ValueError("target_weights must be finite numbers")
     if any(w < 0 for w in target_weights.values()):
         raise ValueError("target_weights cannot contain negative weights")
     if sum(target_weights.values()) > 1.0 + 1e-9:
         raise ValueError("target_weights must sum to <= 1.0")
-    if drift_threshold < 0:
-        raise ValueError("drift_threshold cannot be negative")
+    if not math.isfinite(drift_threshold) or drift_threshold < 0:
+        raise ValueError("drift_threshold must be a finite, non-negative number")
+    if not math.isfinite(cash):
+        raise ValueError("cash must be a finite number")
+    if any(not math.isfinite(pr) for pr in prices.values()):
+        raise ValueError("prices must be finite numbers")
 
-    # Build current values only for symbols with a usable price -- a missing
-    # or non-positive price is flagged below rather than guessed at, or
-    # allowed to crash the whole calculation.
-    current_values: dict[str, float] = {}
+    # Parse holdings once, validating qty as we go.
+    held_qty: dict[str, float] = {}
     for p in positions:
         symbol = p["symbol"]
         qty = float(p["qty"])
-        price = prices.get(symbol)
-        if price is not None and price > 0:
-            current_values[symbol] = qty * price
+        if not math.isfinite(qty):
+            raise ValueError(f"non-finite qty for {symbol}")
+        held_qty[symbol] = held_qty.get(symbol, 0.0) + qty
 
+    # A held position with no usable price can't be safely priced into the
+    # total -- and excluding it would understate the portfolio and mis-size
+    # trades for every *other* symbol too. Refuse to guess for anyone rather
+    # than partially rebalance against a corrupted total.
+    missing_price_symbols = sorted(
+        symbol for symbol in held_qty
+        if prices.get(symbol) is None or prices.get(symbol, 0) <= 0
+    )
+    if missing_price_symbols:
+        return {
+            "total_value": None,
+            "trades": [],
+            "missing_price_symbols": missing_price_symbols,
+            "note": (
+                "Cannot compute a reliable rebalance: no usable price for "
+                f"{', '.join(missing_price_symbols)}. Excluding it would "
+                "understate the portfolio and mis-size every other trade."
+            ),
+        }
+
+    current_values = {symbol: qty * prices[symbol] for symbol, qty in held_qty.items()}
     total_value = cash + sum(current_values.values())
 
     if total_value <= 0:
         return {"total_value": 0.0, "trades": [], "note": "No portfolio value to rebalance."}
 
-    all_symbols = sorted(set(target_weights) | {p["symbol"] for p in positions})
+    all_symbols = sorted(set(target_weights) | set(current_values))
     trades = []
 
     for symbol in all_symbols:
@@ -64,6 +91,8 @@ def compute_rebalance(
         target_weight = target_weights.get(symbol, 0.0)
 
         if price is None or price <= 0:
+            # Only reachable for a target-only symbol we don't currently
+            # hold and have no quote for -- can't size a buy, so flag it.
             current_weight = current_values.get(symbol, 0.0) / total_value
             trades.append({
                 "symbol": symbol,
@@ -85,11 +114,17 @@ def compute_rebalance(
         trade_value = target_value - current_value
         trade_qty = trade_value / price
 
+        qty_final = round(abs(trade_qty), 4)
+        if trade_qty < 0:
+            # Selling -- never round up past what's actually held.
+            qty_final = min(qty_final, held_qty.get(symbol, 0.0))
+        est_value = round(qty_final * price, 2)
+
         trades.append({
             "symbol": symbol,
             "action": "buy" if trade_qty > 0 else "sell",
-            "qty": round(abs(trade_qty), 4),
-            "est_value": round(abs(trade_value), 2),
+            "qty": qty_final,
+            "est_value": est_value,
             "current_weight": round(current_weight, 4),
             "target_weight": round(target_weight, 4),
             "drift": round(drift, 4),
