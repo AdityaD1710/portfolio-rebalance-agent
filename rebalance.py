@@ -41,7 +41,15 @@ def _floor_qty(x: float) -> float:
     """
     if x <= 0:
         return 0.0
-    return math.floor(x * _QTY_SCALE + _FLOOR_EPS) / _QTY_SCALE
+    try:
+        return math.floor(x * _QTY_SCALE + _FLOOR_EPS) / _QTY_SCALE
+    except OverflowError:
+        # x is large enough that x * _QTY_SCALE overflows to infinity
+        # (only possible near float's ~1.8e308 ceiling). A float at that
+        # magnitude has no fractional precision left to floor away in
+        # the first place, so return it unchanged -- still satisfies
+        # "never increases the quantity".
+        return x
 
 
 def compute_rebalance(
@@ -163,7 +171,11 @@ def compute_rebalance(
         t["qty_final"] = _floor_qty(capped)
         t["est_value"] = round(t["qty_final"] * t["price"], 2) if t["qty_final"] > 0 else 0.0
 
-    sell_total = sum(t["est_value"] for t in sells if t["qty_final"] > 0)
+    # Funding must use the exact (unrounded-to-cent) proceeds each sell
+    # realizes -- est_value is cent-rounded for display and can round UP
+    # by up to half a cent per sell, which would let buys draw on proceeds
+    # that don't actually exist.
+    sell_total = sum(t["qty_final"] * t["price"] for t in sells if t["qty_final"] > 0)
     available_funds = cash + sell_total  # cash >= 0 and sell_total >= 0, so this is always >= 0
 
     buy_total = sum(t["trade_qty"] * t["price"] for t in buys)
