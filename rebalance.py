@@ -6,6 +6,10 @@ which trades would bring the portfolio back to target -- flagging only
 positions that have drifted beyond a threshold, rather than rebalancing
 everything to the decimal every time (which would be noisy and unrealistic).
 
+If proposed buys would exceed available cash plus proposed sell proceeds,
+every buy is scaled down proportionally so the resulting trade plan is
+always fundable -- rather than either overspending or refusing to act.
+
 This is deliberately simple on purpose: no Sharpe ratio, no mean-variance
 optimization. Get this loop (real data -> compute -> proposed trade ->
 approval) working end to end first. Fancier math is a stretch goal, not
@@ -84,8 +88,10 @@ def compute_rebalance(
         return {"total_value": 0.0, "trades": [], "note": "No portfolio value to rebalance."}
 
     all_symbols = sorted(set(target_weights) | set(current_values))
-    trades = []
 
+    # First pass: raw (unrounded, signed) trade candidates, so buys can be
+    # scaled to fit available funds before anything is rounded for output.
+    raw_trades = []
     for symbol in all_symbols:
         price = prices.get(symbol)
         target_weight = target_weights.get(symbol, 0.0)
@@ -94,12 +100,11 @@ def compute_rebalance(
             # Only reachable for a target-only symbol we don't currently
             # hold and have no quote for -- can't size a buy, so flag it.
             current_weight = current_values.get(symbol, 0.0) / total_value
-            trades.append({
+            raw_trades.append({
                 "symbol": symbol,
-                "action": "skipped_no_price",
-                "current_weight": round(current_weight, 4),
-                "target_weight": round(target_weight, 4),
-                "drift": round(current_weight - target_weight, 4),
+                "skipped_no_price": True,
+                "current_weight": current_weight,
+                "target_weight": target_weight,
             })
             continue
 
@@ -111,50 +116,88 @@ def compute_rebalance(
             continue
 
         target_value = target_weight * total_value
-        trade_value = target_value - current_value
-        trade_qty = trade_value / price
+        trade_value = target_value - current_value  # signed: + buy, - sell
+        trade_qty = trade_value / price  # signed
+
+        raw_trades.append({
+            "symbol": symbol,
+            "price": price,
+            "trade_qty": trade_qty,
+            "current_weight": current_weight,
+            "target_weight": target_weight,
+            "drift": drift,
+        })
+
+    # Sells are capped at what's actually held -- that's the real cash a
+    # sell can raise, before we know what it needs to fund.
+    sells = [t for t in raw_trades if "trade_qty" in t and t["trade_qty"] < 0]
+    buys = [t for t in raw_trades if "trade_qty" in t and t["trade_qty"] > 0]
+    for t in sells:
+        held = held_qty.get(t["symbol"], 0.0)
+        t["trade_qty"] = -min(abs(t["trade_qty"]), held)
+
+    sell_total = sum(abs(t["trade_qty"] * t["price"]) for t in sells)
+    buy_total = sum(t["trade_qty"] * t["price"] for t in buys)
+    available_funds = cash + sell_total
+
+    # A per-symbol drift filter can retain a buy while suppressing smaller
+    # offsetting sells, so proposed buys can exceed cash + sell proceeds.
+    # Scale every buy down proportionally to fit, rather than either
+    # overspending or refusing to act.
+    scale_note = None
+    if buy_total > available_funds and buy_total > 0:
+        scale = available_funds / buy_total
+        scale_note = (
+            f"Buys scaled to {scale:.1%} of full target to fit available "
+            f"cash (${available_funds:,.2f} available vs ${buy_total:,.2f} needed)."
+        )
+        for t in buys:
+            t["trade_qty"] *= scale
+
+    # Second pass: round for output, re-cap sells post-rounding so they
+    # never exceed held shares, and drop anything that rounds to zero.
+    trades = []
+    for t in raw_trades:
+        if t.get("skipped_no_price"):
+            drift = t["current_weight"] - t["target_weight"]
+            trades.append({
+                "symbol": t["symbol"],
+                "action": "skipped_no_price",
+                "current_weight": round(t["current_weight"], 4),
+                "target_weight": round(t["target_weight"], 4),
+                "drift": round(drift, 4),
+            })
+            continue
+
+        trade_qty = t["trade_qty"]
+        price = t["price"]
 
         qty_final = round(abs(trade_qty), 4)
         if trade_qty < 0:
-            # Selling -- never round up past what's actually held.
-            qty_final = min(qty_final, held_qty.get(symbol, 0.0))
+            qty_final = min(qty_final, held_qty.get(t["symbol"], 0.0))
         if qty_final <= 0:
-            # Rounded down to nothing -- not a real order, skip it.
             continue
         est_value = round(qty_final * price, 2)
 
         trades.append({
-            "symbol": symbol,
+            "symbol": t["symbol"],
             "action": "buy" if trade_qty > 0 else "sell",
             "qty": qty_final,
             "est_value": est_value,
-            "current_weight": round(current_weight, 4),
-            "target_weight": round(target_weight, 4),
-            "drift": round(drift, 4),
+            "current_weight": round(t["current_weight"], 4),
+            "target_weight": round(t["target_weight"], 4),
+            "drift": round(t["drift"], 4),
         })
 
-    # A per-symbol drift filter can retain a buy while suppressing smaller
-    # offsetting sells, proposing more spend than cash + sells actually
-    # cover. Surface that instead of silently returning an unfunded plan.
-    buy_total = sum(t["est_value"] for t in trades if t.get("action") == "buy")
-    sell_total = sum(t["est_value"] for t in trades if t.get("action") == "sell")
-    shortfall = round(buy_total - sell_total - cash, 2)
-
     result = {"total_value": round(total_value, 2), "trades": trades}
-    if shortfall > 0:
-        result["funding_shortfall"] = shortfall
-        result["note"] = (
-            f"Proposed buys exceed available cash plus proposed sell proceeds "
-            f"by ${shortfall:,.2f}. Review allocation or reduce buy sizing before approving."
-        )
+    if scale_note:
+        result["note"] = scale_note
     return result
 
 
 if __name__ == "__main__":
     import json
 
-    # Sample data shaped like what Alpaca's get_positions / get_stock_quote
-    # tools actually return (qty as a string) -- swap for real tool output.
     sample_positions = [
         {"symbol": "AAPL", "qty": "100"},
         {"symbol": "MSFT", "qty": "50"},
